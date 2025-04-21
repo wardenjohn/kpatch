@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <libgen.h>
 #include <argp.h>
+#include <limits.h>
 
 #include "log.h"
 #include "kpatch-elf.h"
@@ -208,7 +209,7 @@ int main(int argc, char *argv[])
 
 	elf_version(EV_CURRENT);
 
-	childobj = basename(arguments.args[0]);
+	childobj = GET_CHILD_OBJ(arguments.args[0]);
 
 	kelf = kpatch_elf_open(arguments.args[0]);
 
