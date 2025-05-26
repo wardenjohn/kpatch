@@ -372,7 +372,8 @@ static bool is_special_static(struct symbol *sym)
 	if (sym->type != STT_OBJECT || sym->bind != STB_LOCAL)
 		return false;
 
-	if  (!strcmp(sym->sec->name, ".data.once"))
+	if  (!strcmp(sym->sec->name, ".data.once") ||
+	     !strcmp(sym->sec->name, ".data..once"))
 		return true;
 
 	for (var_name = var_names; *var_name; var_name++) {
@@ -1699,8 +1700,8 @@ static void kpatch_check_func_profiling_calls(struct kpatch_elf *kelf)
 		    (sym->parent && sym->parent->status == CHANGED))
 			continue;
 		if (!sym->twin->has_func_profiling) {
-			log_normal("function %s has no fentry/mcount call, unable to patch\n",
-				   sym->name);
+			log_error("function %s has no fentry/mcount call, unable to patch\n",
+				  sym->name);
 			errs++;
 		}
 	}
@@ -1716,30 +1717,32 @@ static void kpatch_verify_patchability(struct kpatch_elf *kelf)
 
 	list_for_each_entry(sec, &kelf->sections, list) {
 		if (sec->status == CHANGED && !sec->include) {
-			log_normal("changed section %s not selected for inclusion\n",
-				   sec->name);
+			log_error("changed section %s not selected for inclusion\n",
+				  sec->name);
 			errs++;
 		}
 
 		if (sec->status != SAME && sec->grouped) {
-			log_normal("changed section %s is part of a section group\n",
-				   sec->name);
+			log_error("changed section %s is part of a section group\n",
+				  sec->name);
 			errs++;
 		}
 
 		if (sec->sh.sh_type == SHT_GROUP && sec->status == NEW) {
-			log_normal("new/changed group sections are not supported\n");
+			log_error("new/changed group sections are not supported\n");
 			errs++;
 		}
 
 		/*
 		 * ensure we aren't including .data.* or .bss.*
-		 * (.data.unlikely and .data.once is ok b/c it only has __warned vars)
+		 * (.data.unlikely, .data..unlikely, .data.once, and .data..once is ok
+		 * b/c it only has __warned vars)
 		 */
 		if (sec->include && sec->status != NEW &&
 		    (!strncmp(sec->name, ".data", 5) || !strncmp(sec->name, ".bss", 4)) &&
-		    (strcmp(sec->name, ".data.unlikely") && strcmp(sec->name, ".data.once"))) {
-			log_normal("data section %s selected for inclusion\n",
+		    (strcmp(sec->name, ".data.unlikely") && strcmp(sec->name, ".data..unlikely") &&
+		     strcmp(sec->name, ".data.once") && strcmp(sec->name, ".data..once"))) {
+			log_error("data section %s selected for inclusion\n",
 				   sec->name);
 			errs++;
 		}
@@ -1992,6 +1995,8 @@ static void kpatch_migrate_included_elements(struct kpatch_elf *kelf, struct kpa
 		ERROR("malloc");
 	memset(out, 0, sizeof(*out));
 	out->arch = kelf->arch;
+	out->has_pfe = kelf->has_pfe;
+	out->pfe_ordered = kelf->pfe_ordered;
 	INIT_LIST_HEAD(&out->sections);
 	INIT_LIST_HEAD(&out->symbols);
 	INIT_LIST_HEAD(&out->strings);
@@ -2305,8 +2310,8 @@ static bool jump_table_group_filter(struct lookup_table *lookup,
 		 * This will be upgraded to an error after all jump labels have
 		 * been reported.
 		 */
-		log_normal("Found a jump label at %s()+0x%lx, using key %s.  Jump labels aren't supported with this kernel.  Use static_key_enabled() instead.\n",
-			   code->sym->name, code->addend, key->sym->name);
+		log_error("Found a jump label at %s()+0x%lx, using key %s.  Jump labels aren't supported with this kernel.  Use static_key_enabled() instead.\n",
+			  code->sym->name, code->addend, key->sym->name);
 		jump_label_errors++;
 		return false;
 	}
@@ -2335,8 +2340,8 @@ static bool jump_table_group_filter(struct lookup_table *lookup,
 		 * This will be upgraded to an error after all jump label
 		 * errors have been reported.
 		 */
-		log_normal("Found a jump label at %s()+0x%lx, using key %s, which is defined in a module.  Use static_key_enabled() instead.\n",
-			   code->sym->name, code->addend, key->sym->name);
+		log_error("Found a jump label at %s()+0x%lx, using key %s, which is defined in a module.  Use static_key_enabled() instead.\n",
+			  code->sym->name, code->addend, key->sym->name);
 		jump_label_errors++;
 		return false;
 	}
@@ -2406,7 +2411,7 @@ static bool static_call_sites_group_filter(struct lookup_table *lookup,
 		 * This will be upgraded to an error after all static call
 		 * errors have been reported.
 		 */
-		log_normal("Found a static call at %s()+0x%lx, using key %s, which is defined in a module.  Use KPATCH_STATIC_CALL() instead.\n",
+		log_error("Found a static call at %s()+0x%lx, using key %s, which is defined in a module.  Use KPATCH_STATIC_CALL() instead.\n",
 			   code->sym->name, code->addend, key->sym->name);
 		static_call_errors++;
 		return false;
@@ -3729,7 +3734,7 @@ static void kpatch_set_pfe_link(struct kpatch_elf *kelf)
  * TODO: Eventually we can modify recordmount so that it recognizes our bundled
  * sections as valid and does this work for us.
  */
-static void kpatch_create_ftrace_callsite_sections(struct kpatch_elf *kelf, bool has_pfe)
+static void kpatch_create_ftrace_callsite_sections(struct kpatch_elf *kelf)
 {
 	int nr, index;
 	struct section *sec = NULL;
@@ -3745,13 +3750,7 @@ static void kpatch_create_ftrace_callsite_sections(struct kpatch_elf *kelf, bool
 		    sym->has_func_profiling)
 			nr++;
 
-	if (has_pfe)
-		/*
-		 * Create separate __patchable_function_entries sections
-		 * for each function in the following loop.
-		 */
-		kelf->has_pfe = true;
-	else
+	if (!kelf->has_pfe)
 		/*
 		 * Create a single __mcount_loc section pair for all
 		 * functions.
@@ -3858,7 +3857,14 @@ static void kpatch_create_ftrace_callsite_sections(struct kpatch_elf *kelf, bool
 			 *   - its lone rela is based on the section symbol
 			 */
 			sec = create_section_pair(kelf, "__patchable_function_entries", sizeof(void *), 1);
-			sec->sh.sh_flags |= SHF_WRITE | SHF_ALLOC | SHF_LINK_ORDER;
+			sec->sh.sh_flags |= SHF_WRITE | SHF_ALLOC;
+			/*
+			 * Old linkers don't support mixing ordered and unordered sections, so set
+			 * the SHF_LINK_ORDER flag only if it is set in the pfe section generated by
+			 * the compiler.
+			 */
+			if (kelf->pfe_ordered)
+				sec->sh.sh_flags |= SHF_LINK_ORDER;
 			rela_sym = sym->sec->secsym;
 			rela_offset = 0;
 			rela_sym->pfe = sec;
@@ -4017,8 +4023,8 @@ static void kpatch_no_sibling_calls_ppc64le(struct kpatch_elf *kelf)
 			if (!find_rela_by_offset(sym->sec->rela, offset))
 				continue;
 
-			log_normal("Found an unsupported sibling call at %s()+0x%lx.  Add __attribute__((optimize(\"-fno-optimize-sibling-calls\"))) to %s() definition.\n",
-			      sym->name, sym->sym.st_value + offset, sym->name);
+			log_error("Found an unsupported sibling call at %s()+0x%lx.  Add __attribute__((optimize(\"-fno-optimize-sibling-calls\"))) to %s() definition.\n",
+				  sym->name, sym->sym.st_value + offset, sym->name);
 			sibling_call_errors++;
 		}
 	}
@@ -4158,7 +4164,6 @@ int main(int argc, char *argv[])
 	struct section *relasec, *symtab;
 	char *orig_obj, *patched_obj, *parent_name;
 	char *parent_symtab, *mod_symvers, *patch_name, *output_obj;
-	bool has_pfe = false;
 
 	memset(&arguments, 0, sizeof(arguments));
 	argp_parse (&argp, argc, argv, 0, NULL, &arguments);
@@ -4184,8 +4189,6 @@ int main(int argc, char *argv[])
 
 	kpatch_set_pfe_link(kelf_orig);
 	kpatch_set_pfe_link(kelf_patched);
-	if (kelf_patched->has_pfe)
-		has_pfe = true;
 
 	kpatch_find_func_profiling_calls(kelf_orig);
 	kpatch_find_func_profiling_calls(kelf_patched);
@@ -4266,7 +4269,7 @@ int main(int argc, char *argv[])
 	kpatch_create_callbacks_objname_rela(kelf_out, parent_name);
 	kpatch_build_strings_section_data(kelf_out);
 
-	kpatch_create_ftrace_callsite_sections(kelf_out, has_pfe);
+	kpatch_create_ftrace_callsite_sections(kelf_out);
 
 	/*
 	 *  At this point, the set of output sections and symbols is
